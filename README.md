@@ -16,6 +16,28 @@ jobs onto the same tailnet via `tailscale/github-action`, then:
 
 Needs repo secret `TS_AUTHKEY` (ephemeral, reusable, pre-approved).
 
+### Result (`ubuntu-latest`, 2026-06-23, [run](https://github.com/Mic92/tribuchet-action/actions/runs/28025937315))
+
+```
+pong from ts-probe-server via DERP(ord) in 172ms
+pong from ts-probe-server via DERP(ord) in 62ms
+pong from ts-probe-server via DERP(ord) in 62ms
+pong from ts-probe-server via 20.118.213.18:39952 in 37ms
+```
+
+| | result |
+|---|---|
+| Path | DERP relay first, **upgraded to direct WireGuard** after ~3 pings |
+| RTT | 62 ms (DERP) → 37 ms (direct) |
+| iperf3 forward | **643 Mbit/s** |
+| iperf3 reverse | **617 Mbit/s** |
+
+Tailscale's NAT traversal succeeds between two Azure-NAT'd hosted
+runners where libp2p DCUtR did not, and the resulting direct path
+moves ~600 Mbit/s — ample for NAR transfer. **Viable transport for
+tribuchet workers on GitHub-hosted CI**, with zero self-hosted infra
+(or Headscale for an unlimited self-hosted control plane).
+
 ## libp2p probe (concluded, code removed)
 
 See git history at `e4c3b61`. Result on `ubuntu-latest`, 2026-06-23:

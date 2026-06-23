@@ -12,6 +12,8 @@ jobs:
   server:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    env:
+      GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@v4
 
@@ -37,18 +39,23 @@ jobs:
           path: addr.txt
           retention-days: 1
 
-      # Keep an iperf3 server up while the client job connects. The runner
-      # process tree survives across steps, so backgrounding works; we just
-      # need this step to block until the client is done or we time out.
+      # Keep an iperf3 server up while the client job connects, then exit as
+      # soon as the client has uploaded its results artifact so the workflow
+      # doesn't idle for the full timeout.
       - name: run iperf3 server
         run: |
           set -euxo pipefail
           iperf3 -s -p 5201 &
           srv=$!
-          # Give the client up to 8 minutes (artifact polling + 2 runs).
-          for i in $(seq 1 240); do
+          done_artifact="ts-results-${{ github.run_id }}-${{ github.run_attempt }}"
+          for i in $(seq 1 96); do
             kill -0 "$srv" 2>/dev/null || break
-            sleep 2
+            if gh api "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/artifacts" \
+                 -q '.artifacts[].name' 2>/dev/null | grep -qx "$done_artifact"; then
+              echo "client finished"
+              break
+            fi
+            sleep 5
           done
           kill "$srv" 2>/dev/null || true
 
