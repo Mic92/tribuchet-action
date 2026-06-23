@@ -1,8 +1,9 @@
 //! p2p-probe: minimal libp2p peer used to test whether two GitHub Actions
-//! runners (both behind NAT) can reach each other, using a public circuit
-//! relay v2 for rendezvous and DCUtR for hole punching.
+//! runners (both behind NAT) can reach each other, using circuit relay v2
+//! for rendezvous and DCUtR for hole punching.
 //!
-//! listen mode: connects to one of the given relays, makes a reservation,
+//! listen mode: joins the public IPFS (Amino) DHT, discovers peers that
+//!   advertise the relay hop protocol, reserves a slot on one of them,
 //!   writes the relayed multiaddr to `--out`, then waits until the dialer
 //!   pings it (or times out).
 //!
@@ -11,7 +12,7 @@
 //!   resulting ping ran over a relayed or a direct connection.
 
 use std::{
-    collections::HashSet,
+    collections::{HashSet, VecDeque},
     path::PathBuf,
     str::FromStr,
     time::{Duration, Instant},
@@ -22,16 +23,17 @@ use clap::{Parser, Subcommand};
 use futures::StreamExt;
 use libp2p::{
     core::{multiaddr::Protocol, transport::ListenerId, ConnectedPoint},
-    dcutr, identify, identity, noise, ping, relay,
+    dcutr, identify, identity, kad, noise, ping, relay,
     swarm::{NetworkBehaviour, SwarmEvent},
     tcp, yamux, Multiaddr, PeerId,
 };
 use serde::{Deserialize, Serialize};
 use tracing_subscriber::EnvFilter;
 
-/// Public IPFS bootstrap nodes that speak circuit relay v2. Used when no
-/// `--relay` is given so the experiment needs no self-hosted infrastructure.
-const DEFAULT_RELAYS: &[&str] = &[
+/// Public IPFS bootstrap nodes. They are only used to join the Amino DHT;
+/// they refuse relay reservations themselves, so we discover other DHT
+/// peers that advertise the relay hop protocol and reserve there instead.
+const DHT_BOOTSTRAP: &[&str] = &[
     "/dnsaddr/bootstrap.libp2p.io/p2p/QmNnooDu7bfjPFoTZYxMNLWUQJyrVwtbZg5gBMjTezGAJN",
     "/dnsaddr/bootstrap.libp2p.io/p2p/QmQCU2EcMqAqQPR2i9bChDtGNJchTbq5TbXJJ16u19uLTa",
     "/dnsaddr/bootstrap.libp2p.io/p2p/QmbLHAnMoJPWSCR5Zhtx6BHJX9KiKNN6tpvbUcqanj75Nb",
@@ -41,14 +43,18 @@ const DEFAULT_RELAYS: &[&str] = &[
 #[derive(Parser, Debug)]
 #[command(about = "libp2p NAT traversal probe for GitHub Actions")]
 struct Opts {
-    /// Relay multiaddr(s) to use (repeatable). Defaults to public IPFS
-    /// bootstrap nodes.
+    /// Explicit relay multiaddr(s) to reserve on. When given, DHT discovery
+    /// is skipped.
     #[arg(long = "relay")]
     relays: Vec<Multiaddr>,
 
     /// Overall timeout for the run.
     #[arg(long, default_value = "300")]
     timeout_secs: u64,
+
+    /// How long to spend discovering a relay via the DHT before giving up.
+    #[arg(long, default_value = "120")]
+    discovery_secs: u64,
 
     #[command(subcommand)]
     mode: Mode,
@@ -85,6 +91,7 @@ struct Behaviour {
     identify: identify::Behaviour,
     dcutr: dcutr::Behaviour,
     ping: ping::Behaviour,
+    kad: kad::Behaviour<kad::store::MemoryStore>,
 }
 
 #[tokio::main]
@@ -96,15 +103,6 @@ async fn main() -> Result<()> {
         .init();
 
     let opts = Opts::parse();
-
-    let relays: Vec<Multiaddr> = if opts.relays.is_empty() {
-        DEFAULT_RELAYS
-            .iter()
-            .map(|s| Multiaddr::from_str(s).expect("static addr"))
-            .collect()
-    } else {
-        opts.relays.clone()
-    };
 
     let key = identity::Keypair::generate_ed25519();
     let local_peer_id = key.public().to_peer_id();
@@ -120,20 +118,42 @@ async fn main() -> Result<()> {
         .with_quic()
         .with_dns()?
         .with_relay_client(noise::Config::new, yamux::Config::default)?
-        .with_behaviour(|keypair, relay_behaviour| Behaviour {
-            relay_client: relay_behaviour,
-            identify: identify::Behaviour::new(identify::Config::new(
-                "/tribuchet-probe/0.1".into(),
-                keypair.public(),
-            )),
-            dcutr: dcutr::Behaviour::new(keypair.public().to_peer_id()),
-            ping: ping::Behaviour::new(ping::Config::new()),
+        .with_behaviour(|keypair, relay_behaviour| {
+            let id = keypair.public().to_peer_id();
+            let mut kad = kad::Behaviour::with_config(
+                id,
+                kad::store::MemoryStore::new(id),
+                kad::Config::new(kad::PROTOCOL_NAME),
+            );
+            // Stay a DHT client: we are behind NAT and only need lookups.
+            kad.set_mode(Some(kad::Mode::Client));
+            Behaviour {
+                relay_client: relay_behaviour,
+                identify: identify::Behaviour::new(identify::Config::new(
+                    "/tribuchet-probe/0.1".into(),
+                    keypair.public(),
+                )),
+                dcutr: dcutr::Behaviour::new(id),
+                ping: ping::Behaviour::new(ping::Config::new()),
+                kad,
+            }
         })?
         .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(60)))
         .build();
 
-    swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse()?)?;
-    swarm.listen_on("/ip4/0.0.0.0/udp/0/quic-v1".parse()?)?;
+    // Listen on both stacks; v6 is best-effort because not every runner
+    // has it, but when it does QUIC/v6 tends to hole-punch better than v4.
+    for addr in [
+        "/ip4/0.0.0.0/tcp/0",
+        "/ip4/0.0.0.0/udp/0/quic-v1",
+        "/ip6/::/tcp/0",
+        "/ip6/::/udp/0/quic-v1",
+    ] {
+        match swarm.listen_on(addr.parse()?) {
+            Ok(_) => {}
+            Err(e) => tracing::warn!(addr, %e, "listen_on failed (continuing)"),
+        }
+    }
 
     // Give the listeners a moment to bind so identify can report real
     // addresses to the relay.
@@ -148,24 +168,34 @@ async fn main() -> Result<()> {
         }
     }
 
+    // Seed the DHT routing table with the public bootstrap nodes so the
+    // listener can discover relay-capable peers without any private infra.
+    let mut bootstrap_peers: HashSet<PeerId> = HashSet::new();
+    for s in DHT_BOOTSTRAP {
+        let ma: Multiaddr = Multiaddr::from_str(s).expect("static addr");
+        if let Some(id) = peer_id_of(&ma) {
+            bootstrap_peers.insert(id);
+            swarm.behaviour_mut().kad.add_address(&id, ma);
+        }
+    }
+    let _ = swarm.behaviour_mut().kad.bootstrap();
+
     let deadline = Instant::now() + Duration::from_secs(opts.timeout_secs);
-    let relay_peers: HashSet<PeerId> = relays.iter().filter_map(peer_id_of).collect();
 
     match opts.mode {
         Mode::Listen { out } => {
             run_listen(
                 &mut swarm,
-                &relays,
-                &relay_peers,
+                &opts.relays,
+                &bootstrap_peers,
                 local_peer_id,
                 &out,
+                Duration::from_secs(opts.discovery_secs),
                 deadline,
             )
             .await
         }
-        Mode::Dial { rendezvous } => {
-            run_dial(&mut swarm, &rendezvous, &relay_peers, deadline).await
-        }
+        Mode::Dial { rendezvous } => run_dial(&mut swarm, &rendezvous, deadline).await,
     }
 }
 
@@ -176,86 +206,185 @@ fn peer_id_of(addr: &Multiaddr) -> Option<PeerId> {
     })
 }
 
-async fn run_listen(
-    swarm: &mut libp2p::Swarm<Behaviour>,
-    relays: &[Multiaddr],
-    relay_peers: &HashSet<PeerId>,
-    local_peer_id: PeerId,
-    out: &PathBuf,
-    deadline: Instant,
-) -> Result<()> {
-    // Try each relay until one accepts a reservation.
-    let mut accepted: Vec<Multiaddr> = Vec::new();
-    'relays: for relay in relays {
-        tracing::info!(%relay, "attempting reservation");
-        let listener: ListenerId = match swarm.listen_on(relay.clone().with(Protocol::P2pCircuit)) {
-            Ok(id) => id,
-            Err(e) => {
-                tracing::warn!(%relay, error=%e, "listen_on failed");
-                continue;
+/// Heuristic for "probably reachable from the public internet": skip
+/// loopback, RFC1918, link-local and CGNAT ranges so we don't waste
+/// reservation attempts on a relay's LAN address.
+fn is_public(addr: &Multiaddr) -> bool {
+    for p in addr.iter() {
+        match p {
+            Protocol::P2pCircuit => return false,
+            Protocol::Ip4(ip) => {
+                if ip.is_loopback() || ip.is_private() || ip.is_link_local() {
+                    return false;
+                }
+                let o = ip.octets();
+                // 100.64.0.0/10 (CGNAT)
+                if o[0] == 100 && (64..128).contains(&o[1]) {
+                    return false;
+                }
             }
-        };
-        let attempt_deadline = Instant::now() + Duration::from_secs(30);
-        loop {
-            let remaining = attempt_deadline.saturating_duration_since(Instant::now());
-            let ev = tokio::select! {
-                ev = swarm.select_next_some() => ev,
-                () = tokio::time::sleep(remaining) => {
-                    tracing::warn!(%relay, "reservation timed out");
-                    let _ = swarm.remove_listener(listener);
-                    continue 'relays;
+            Protocol::Ip6(ip) => {
+                if ip.is_loopback() || ip.is_unspecified() {
+                    return false;
                 }
-            };
-            match ev {
-                SwarmEvent::Behaviour(BehaviourEvent::RelayClient(
-                    relay::client::Event::ReservationReqAccepted { .. },
-                )) => {
-                    tracing::info!(%relay, "reservation accepted");
+                let seg = ip.segments();
+                // fc00::/7 (ULA), fe80::/10 (link-local)
+                if (seg[0] & 0xfe00) == 0xfc00 || (seg[0] & 0xffc0) == 0xfe80 {
+                    return false;
                 }
-                SwarmEvent::NewListenAddr {
-                    listener_id,
-                    address,
-                } if listener_id == listener => {
-                    tracing::info!(%address, "relayed listen addr");
-                    accepted.push(address);
-                    // One relayed addr is enough to publish; stop probing relays.
-                    break 'relays;
-                }
-                SwarmEvent::ListenerClosed {
-                    listener_id,
-                    reason,
-                    ..
-                } if listener_id == listener => {
-                    tracing::warn!(%relay, ?reason, "relay listener closed");
-                    continue 'relays;
-                }
-                SwarmEvent::OutgoingConnectionError { error, .. } => {
-                    tracing::warn!(%relay, %error, "relay dial failed");
-                    let _ = swarm.remove_listener(listener);
-                    continue 'relays;
-                }
-                other => tracing::debug!(?other),
             }
+            _ => {}
         }
     }
+    true
+}
 
-    if accepted.is_empty() {
-        bail!("no relay accepted a reservation");
+#[allow(clippy::too_many_arguments)]
+async fn run_listen(
+    swarm: &mut libp2p::Swarm<Behaviour>,
+    explicit_relays: &[Multiaddr],
+    bootstrap_peers: &HashSet<PeerId>,
+    local_peer_id: PeerId,
+    out: &PathBuf,
+    discovery: Duration,
+    deadline: Instant,
+) -> Result<()> {
+    // Relay candidates discovered via identify, keyed by the address we will
+    // listen on (already including /p2p/<relay>).
+    let mut candidates: VecDeque<(PeerId, Multiaddr)> = VecDeque::new();
+    let mut tried: HashSet<PeerId> = HashSet::new();
+    // Reservation attempt currently in flight.
+    let mut active: Option<(PeerId, ListenerId)> = None;
+    let mut accepted: Vec<Multiaddr> = Vec::new();
+
+    // If the user passed explicit relays, skip DHT discovery entirely.
+    for r in explicit_relays {
+        if let Some(id) = peer_id_of(r) {
+            candidates.push_back((id, r.clone()));
+        } else {
+            tracing::warn!(addr=%r, "relay addr has no /p2p peer id, ignoring");
+        }
+    }
+    let use_dht = explicit_relays.is_empty();
+
+    let discovery_deadline = Instant::now() + discovery;
+    let mut next_walk = Instant::now();
+
+    loop {
+        // Kick a random-walk query every few seconds to keep meeting new
+        // peers; identify on those connections is what surfaces relay
+        // candidates.
+        if use_dht && Instant::now() >= next_walk {
+            swarm
+                .behaviour_mut()
+                .kad
+                .get_closest_peers(PeerId::random());
+            next_walk = Instant::now() + Duration::from_secs(5);
+        }
+
+        // Start the next reservation attempt if idle.
+        if active.is_none() {
+            while let Some((peer, addr)) = candidates.pop_front() {
+                if !tried.insert(peer) {
+                    continue;
+                }
+                tracing::info!(%peer, %addr, "attempting reservation");
+                match swarm.listen_on(addr.clone().with(Protocol::P2pCircuit)) {
+                    Ok(id) => {
+                        active = Some((peer, id));
+                        break;
+                    }
+                    Err(e) => tracing::warn!(%peer, %addr, %e, "listen_on failed"),
+                }
+            }
+        }
+
+        if !accepted.is_empty() {
+            break;
+        }
+        if Instant::now() >= discovery_deadline && active.is_none() && candidates.is_empty() {
+            bail!(
+                "no relay accepted a reservation within {}s ({} peers tried)",
+                discovery.as_secs(),
+                tried.len()
+            );
+        }
+
+        let until_walk = next_walk.saturating_duration_since(Instant::now());
+        let ev = tokio::select! {
+            ev = swarm.select_next_some() => ev,
+            () = tokio::time::sleep(until_walk), if use_dht => continue,
+        };
+
+        match ev {
+            SwarmEvent::Behaviour(BehaviourEvent::Identify(identify::Event::Received {
+                peer_id,
+                info,
+                ..
+            })) => {
+                // Learn our public address from anyone who tells us; DCUtR
+                // needs an external address on this side too.
+                swarm.add_external_address(info.observed_addr.clone());
+                if use_dht
+                    && !bootstrap_peers.contains(&peer_id)
+                    && !tried.contains(&peer_id)
+                    && info.protocols.contains(&relay::HOP_PROTOCOL_NAME)
+                {
+                    if let Some(a) = info
+                        .listen_addrs
+                        .iter()
+                        .find(|a| is_public(a))
+                        .or(info.listen_addrs.first())
+                    {
+                        let addr = a.clone().with(Protocol::P2p(peer_id));
+                        tracing::info!(%peer_id, %addr, "found relay candidate");
+                        candidates.push_back((peer_id, addr));
+                    }
+                }
+            }
+            SwarmEvent::NewListenAddr {
+                listener_id,
+                address,
+            } if active.map(|(_, l)| l) == Some(listener_id) => {
+                tracing::info!(%address, "relay reservation accepted");
+                accepted.push(address);
+            }
+            SwarmEvent::ListenerClosed {
+                listener_id,
+                reason,
+                ..
+            } if active.map(|(_, l)| l) == Some(listener_id) => {
+                tracing::warn!(?reason, "relay listener closed");
+                active = None;
+            }
+            SwarmEvent::OutgoingConnectionError { peer_id, error, .. }
+                if active.map(|(p, _)| Some(p)) == Some(peer_id) =>
+            {
+                tracing::warn!(%error, "relay dial failed");
+                if let Some((_, l)) = active.take() {
+                    let _ = swarm.remove_listener(l);
+                }
+            }
+            SwarmEvent::Behaviour(BehaviourEvent::Kad(ev)) => tracing::debug!(?ev),
+            other => tracing::debug!(?other),
+        }
     }
 
     let rendezvous = Rendezvous {
         peer_id: local_peer_id.to_string(),
-        circuit_addrs: accepted
-            .iter()
-            .map(|a| a.clone().with(Protocol::P2p(local_peer_id)).to_string())
-            .collect(),
+        // The relay client already appends /p2p/<self> to the listen addr.
+        circuit_addrs: accepted.iter().map(ToString::to_string).collect(),
     };
     let tmp = out.with_extension("tmp");
     tokio::fs::write(&tmp, serde_json::to_vec_pretty(&rendezvous)?).await?;
     tokio::fs::rename(&tmp, out).await?;
     tracing::info!(file=%out.display(), "wrote rendezvous");
 
-    // Wait for the dialer to reach us.
+    // Wait for the dialer to reach us. DHT discovery means we are connected
+    // to dozens of unrelated peers that also ping, so only count pings from
+    // peers that actually arrived via the relayed circuit (or were later
+    // upgraded by DCUtR from such a connection).
+    let mut dialer_peers: HashSet<PeerId> = HashSet::new();
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
@@ -268,9 +397,14 @@ async fn run_listen(
         match ev {
             SwarmEvent::ConnectionEstablished {
                 peer_id, endpoint, ..
-            } if !relay_peers.contains(&peer_id) => {
-                let direct = !is_relayed(&endpoint);
-                tracing::info!(peer=%peer_id, direct, ?endpoint, "dialer connected");
+            } if is_relayed(&endpoint) && !bootstrap_peers.contains(&peer_id) => {
+                tracing::info!(peer=%peer_id, ?endpoint, "dialer connected via relay");
+                dialer_peers.insert(peer_id);
+            }
+            SwarmEvent::ConnectionEstablished {
+                peer_id, endpoint, ..
+            } if dialer_peers.contains(&peer_id) => {
+                tracing::info!(peer=%peer_id, ?endpoint, "dialer direct connection");
             }
             SwarmEvent::Behaviour(BehaviourEvent::Dcutr(ev)) => {
                 tracing::info!(?ev, "dcutr");
@@ -279,7 +413,7 @@ async fn run_listen(
                 peer,
                 result: Ok(rtt),
                 ..
-            })) if !relay_peers.contains(&peer) => {
+            })) if dialer_peers.contains(&peer) => {
                 tracing::info!(peer=%peer, ?rtt, "ping from dialer — success");
                 println!("LISTENER_OK peer={peer} rtt_ms={}", rtt.as_millis());
                 return Ok(());
@@ -292,7 +426,6 @@ async fn run_listen(
 async fn run_dial(
     swarm: &mut libp2p::Swarm<Behaviour>,
     rendezvous: &PathBuf,
-    relay_peers: &HashSet<PeerId>,
     deadline: Instant,
 ) -> Result<()> {
     let data = tokio::fs::read(rendezvous)
@@ -304,16 +437,12 @@ async fn run_dial(
 
     // Dial the relay first so identify can learn our observed address;
     // DCUtR needs that to coordinate the hole punch.
-    let mut extra_relay_peers = relay_peers.clone();
     for a in &rv.circuit_addrs {
         let ma: Multiaddr = a.parse()?;
         let relay_only: Multiaddr = ma
             .iter()
             .take_while(|p| !matches!(p, Protocol::P2pCircuit))
             .collect();
-        if let Some(id) = peer_id_of(&relay_only) {
-            extra_relay_peers.insert(id);
-        }
         if let Err(e) = swarm.dial(relay_only.clone()) {
             tracing::warn!(addr=%relay_only, %e, "relay pre-dial failed");
         }
@@ -377,7 +506,12 @@ async fn run_dial(
             {
                 tracing::warn!(%error, "outgoing connection error");
             }
-            SwarmEvent::Behaviour(BehaviourEvent::Identify(ev)) => tracing::debug!(?ev),
+            SwarmEvent::Behaviour(BehaviourEvent::Identify(identify::Event::Received {
+                info,
+                ..
+            })) => {
+                swarm.add_external_address(info.observed_addr);
+            }
             other => tracing::debug!(?other),
         }
     }
@@ -406,6 +540,9 @@ async fn learn_observed_addr(swarm: &mut libp2p::Swarm<Behaviour>, timeout: Dura
     let until = Instant::now() + timeout;
     loop {
         let remaining = until.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return;
+        }
         let ev = tokio::select! {
             ev = swarm.select_next_some() => ev,
             () = tokio::time::sleep(remaining) => return,
