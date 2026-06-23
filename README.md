@@ -1,5 +1,7 @@
 # tribuchet-action
 
+> **Archived.** Experiment complete; see [conclusion](#conclusion).
+
 Feasibility probe: can two GitHub Actions runners (both behind NAT)
 reach each other over [libp2p]?
 
@@ -39,3 +41,29 @@ Pass `--relay <multiaddr>` (repeatable) to use a specific relay
 instead of the public IPFS bootstrap nodes.
 
 [libp2p]: https://github.com/libp2p/rust-libp2p
+
+## Conclusion
+
+Tested on GitHub-hosted `ubuntu-latest` runners, 2026-06-23
+([run](https://github.com/Mic92/tribuchet-action/actions/runs/28024695079)).
+
+```
+DIALER_RESULT relayed=true direct=false hole_punch=false
+```
+
+| | result |
+|---|---|
+| DHT relay discovery | works; reservation accepted on a random kubo peer in ~2 s |
+| Relayed connection (runner ↔ runner) | works, ~95 ms RTT |
+| DCUtR hole punch | **fails** (`InboundError(UnexpectedEof)`); Azure NAT on hosted runners is symmetric/endpoint-dependent |
+| Bandwidth | circuit-relay-v2 *limited* relays cap each connection to **128 KiB / 2 min** by spec — fine for signalling, useless for NAR transfer |
+
+**Takeaway for [tribuchet]:** libp2p gives a zero-infra control
+channel between two NAT'd CI runners, but no usable data plane: the
+hole punch doesn't go through, and stranger-operated relays are
+throttled. Since the tribuchet hub already has a public address, the
+existing gRPC/mTLS dial-out from workers is strictly simpler and
+unmetered. Worker↔worker direct transfer (the one place libp2p could
+have helped) is exactly what fails here. Not adopting libp2p.
+
+[tribuchet]: https://github.com/Mic92/tribuchet
