@@ -14,9 +14,29 @@ jobs onto the same tailnet via `tailscale/github-action`, then:
    DERP relay vs direct path) and `iperf3` in both directions, and
    writes the throughput to the step summary.
 
-Needs repo secrets `TS_OAUTH_CLIENT_ID` / `TS_OAUTH_SECRET` from a
-Tailscale OAuth client with the **Auth Keys: write** scope, bound to
-`tag:ci` (which must exist under `tagOwners` in the tailnet ACL).
+### Tailscale setup
+
+1. **Define the tag** in the tailnet policy at
+   <https://login.tailscale.com/admin/acls> (the OAuth client can only
+   apply tags that already exist):
+
+   ```jsonc
+   "tagOwners": {
+     "tag:ci": ["autogroup:admin"]
+   },
+   ```
+
+2. **Create an OAuth client** at
+   <https://login.tailscale.com/admin/settings/oauth> → *Generate
+   OAuth client…* with scope **Auth Keys → Write** and tag
+   `tag:ci`. Copy the client ID and secret (the secret is shown only
+   once).
+
+3. **Add repo secrets** `TS_OAUTH_CLIENT_ID` and `TS_OAUTH_SECRET`.
+
+The action then mints a fresh ephemeral, pre-approved auth key per job
+and the node is removed from the tailnet shortly after the runner
+exits, so CI does not accumulate against the device limit.
 
 ### Result (`ubuntu-latest`, 2026-06-23, [run](https://github.com/Mic92/tribuchet-action/actions/runs/28025937315))
 
