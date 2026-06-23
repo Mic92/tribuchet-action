@@ -1,51 +1,24 @@
 # tribuchet-action
 
-> **Archived.** Experiment complete; see [conclusion](#conclusion).
+Feasibility probes for connecting two GitHub-hosted Actions runners
+behind NAT, in service of [tribuchet] remote builds.
 
-Feasibility probe: can two GitHub Actions runners (both behind NAT)
-reach each other over [libp2p]?
+## tailscale probe (current)
 
-The `p2p-probe` binary is a minimal libp2p peer with TCP + QUIC
-transports, the circuit relay v2 client, `identify`, `dcutr` (hole
-punching) and `ping`. The [workflow](.github/workflows/p2p-probe.yml)
-starts two parallel jobs:
+[Workflow](.github/workflows/tailscale-probe.yml) brings two parallel
+jobs onto the same tailnet via `tailscale/github-action`, then:
 
-1. **listener** reserves a slot on a public IPFS bootstrap relay,
-   uploads its relayed multiaddr as a run artifact, and waits for a
-   ping.
-2. **dialer** polls for the artifact, dials the listener through the
-   relay, lets DCUtR try to upgrade to a direct connection, and
-   reports whether the resulting connection was relayed or direct.
+1. **server** publishes its tailnet IP as a run artifact and runs
+   `iperf3 -s`.
+2. **client** polls for the artifact, runs `tailscale ping` (reports
+   DERP relay vs direct path) and `iperf3` in both directions, and
+   writes the throughput to the step summary.
 
-The dialer step prints a line like
+Needs repo secret `TS_AUTHKEY` (ephemeral, reusable, pre-approved).
 
-```
-DIALER_RESULT relayed=true direct=true hole_punch=true
-```
+## libp2p probe (concluded, code removed)
 
-`relayed=true` means libp2p connectivity works at all (good enough for
-a control channel). `direct=true` / `hole_punch=true` means the two
-runners managed a direct NAT-traversed connection, which is what
-tribuchet would want for bulk NAR transfer.
-
-## Running locally
-
-```sh
-cargo build --release
-./target/release/p2p-probe listen --out /tmp/rv.json &
-# wait for /tmp/rv.json to appear, then on another host:
-./target/release/p2p-probe dial --rendezvous /tmp/rv.json
-```
-
-Pass `--relay <multiaddr>` (repeatable) to use a specific relay
-instead of the public IPFS bootstrap nodes.
-
-[libp2p]: https://github.com/libp2p/rust-libp2p
-
-## Conclusion
-
-Tested on GitHub-hosted `ubuntu-latest` runners, 2026-06-23
-([run](https://github.com/Mic92/tribuchet-action/actions/runs/28024695079)).
+See git history at `e4c3b61`. Result on `ubuntu-latest`, 2026-06-23:
 
 ```
 DIALER_RESULT relayed=true direct=false hole_punch=false
@@ -53,17 +26,12 @@ DIALER_RESULT relayed=true direct=false hole_punch=false
 
 | | result |
 |---|---|
-| DHT relay discovery | works; reservation accepted on a random kubo peer in ~2 s |
+| DHT relay discovery | works; reservation on a random kubo peer in ~2 s |
 | Relayed connection (runner ↔ runner) | works, ~95 ms RTT |
-| DCUtR hole punch | **fails** (`InboundError(UnexpectedEof)`); Azure NAT on hosted runners is symmetric/endpoint-dependent |
-| Bandwidth | circuit-relay-v2 *limited* relays cap each connection to **128 KiB / 2 min** by spec — fine for signalling, useless for NAR transfer |
+| DCUtR hole punch | **fails** (Azure symmetric NAT) |
+| Bandwidth | circuit-relay-v2 *limited* relays cap at **128 KiB / 2 min** |
 
-**Takeaway for [tribuchet]:** libp2p gives a zero-infra control
-channel between two NAT'd CI runners, but no usable data plane: the
-hole punch doesn't go through, and stranger-operated relays are
-throttled. Since the tribuchet hub already has a public address, the
-existing gRPC/mTLS dial-out from workers is strictly simpler and
-unmetered. Worker↔worker direct transfer (the one place libp2p could
-have helped) is exactly what fails here. Not adopting libp2p.
+libp2p gives a zero-infra control channel but no usable data plane on
+hosted runners; not adopted.
 
 [tribuchet]: https://github.com/Mic92/tribuchet

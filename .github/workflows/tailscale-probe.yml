@@ -1,0 +1,138 @@
+name: tailscale-probe
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  server:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: tailscale/github-action@v3
+        with:
+          authkey: ${{ secrets.TS_AUTHKEY }}
+          hostname: ts-probe-server-${{ github.run_id }}
+
+      - name: install iperf3
+        run: sudo apt-get update -qq && sudo apt-get install -yqq iperf3
+
+      - name: publish address
+        run: |
+          set -euxo pipefail
+          tailscale ip -4 > addr.txt
+          tailscale ip -6 >> addr.txt || true
+          tailscale status
+          cat addr.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ts-addr-${{ github.run_id }}-${{ github.run_attempt }}
+          path: addr.txt
+          retention-days: 1
+
+      # Keep an iperf3 server up while the client job connects. The runner
+      # process tree survives across steps, so backgrounding works; we just
+      # need this step to block until the client is done or we time out.
+      - name: run iperf3 server
+        run: |
+          set -euxo pipefail
+          iperf3 -s -p 5201 &
+          srv=$!
+          # Give the client up to 8 minutes (artifact polling + 2 runs).
+          for i in $(seq 1 240); do
+            kill -0 "$srv" 2>/dev/null || break
+            sleep 2
+          done
+          kill "$srv" 2>/dev/null || true
+
+  client:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: tailscale/github-action@v3
+        with:
+          authkey: ${{ secrets.TS_AUTHKEY }}
+          hostname: ts-probe-client-${{ github.run_id }}
+
+      - name: install iperf3
+        run: sudo apt-get update -qq && sudo apt-get install -yqq iperf3 jq
+
+      - name: fetch server address
+        run: |
+          set -euxo pipefail
+          name="ts-addr-${{ github.run_id }}-${{ github.run_attempt }}"
+          for i in $(seq 1 120); do
+            if gh run download "${{ github.run_id }}" -n "$name" -D addr 2>/dev/null; then
+              break
+            fi
+            sleep 5
+          done
+          test -f addr/addr.txt
+          cat addr/addr.txt
+          echo "SERVER_IP=$(head -n1 addr/addr.txt)" >> "$GITHUB_ENV"
+
+      - name: tailscale path
+        run: |
+          set -eux
+          tailscale status
+          # `tailscale ping` reports whether traffic goes via DERP relay or
+          # a direct connection, and tries to upgrade while pinging.
+          tailscale ping -c 10 "$SERVER_IP" | tee ping.txt || true
+
+      - name: iperf3 forward
+        run: |
+          set -euxo pipefail
+          # Retry briefly: server may still be installing iperf3.
+          for i in $(seq 1 12); do
+            if iperf3 -c "$SERVER_IP" -p 5201 -t 20 -J > fwd.json 2>fwd.err; then
+              break
+            fi
+            cat fwd.err || true
+            sleep 5
+          done
+          jq -r '.end.sum_received.bits_per_second/1e6 | "forward: \(. | floor) Mbit/s"' fwd.json
+
+      - name: iperf3 reverse
+        run: |
+          set -euxo pipefail
+          iperf3 -c "$SERVER_IP" -p 5201 -t 20 -R -J > rev.json
+          jq -r '.end.sum_received.bits_per_second/1e6 | "reverse: \(. | floor) Mbit/s"' rev.json
+
+      - name: summary
+        if: always()
+        run: |
+          {
+            echo "## tailscale-probe"
+            echo
+            echo '### tailscale ping'
+            echo '```'
+            cat ping.txt 2>/dev/null || echo "n/a"
+            echo '```'
+            echo
+            echo '### iperf3'
+            echo '```'
+            jq -r '.end.sum_received.bits_per_second/1e6 | "forward recv: \(. | floor) Mbit/s"' fwd.json 2>/dev/null || echo "forward: n/a"
+            jq -r '.end.sum_received.bits_per_second/1e6 | "reverse recv: \(. | floor) Mbit/s"' rev.json 2>/dev/null || echo "reverse: n/a"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ts-results-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ping.txt
+            fwd.json
+            rev.json
+          retention-days: 7
