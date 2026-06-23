@@ -14,7 +14,9 @@ jobs onto the same tailnet via `tailscale/github-action`, then:
    DERP relay vs direct path) and `iperf3` in both directions, and
    writes the throughput to the step summary.
 
-Needs repo secret `TS_AUTHKEY` (ephemeral, reusable, pre-approved).
+Needs repo secrets `TS_OAUTH_CLIENT_ID` / `TS_OAUTH_SECRET` from a
+Tailscale OAuth client with the **Auth Keys: write** scope, bound to
+`tag:ci` (which must exist under `tagOwners` in the tailnet ACL).
 
 ### Result (`ubuntu-latest`, 2026-06-23, [run](https://github.com/Mic92/tribuchet-action/actions/runs/28025937315))
 
